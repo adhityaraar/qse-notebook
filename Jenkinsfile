@@ -1,32 +1,26 @@
 // =============================================================================
 // Jenkinsfile — IBM Quantum Safe Explorer CI/CD
 // Repo    : https://github.com/adhityaraar/qse-notebook
-// Project : cryptchat-server (Maven, Java 17)
+// Project : cryptchat-server  |  Java 17  |  Maven
 // =============================================================================
 
 pipeline {
     agent any
-
     triggers { pollSCM('* * * * *') }
-
-    environment {
-        PROJECT_DIR = "cryptchat-server"
-        QSE_URL     = "http://localhost:8000"
-        APP_NAME    = "cryptchat-server"
-        APP_VERSION = "0.0.1-SNAPSHOT"
-    }
 
     stages {
 
         stage('Detect Changes') {
             steps {
-                script {
-                    def changed = sh(
-                        script: "git diff --name-only HEAD~1 HEAD 2>/dev/null | grep '\\.java' || true",
-                        returnStdout: true
-                    ).trim()
-                    echo changed ? "Changed Java files:\n${changed}" : "No Java changes (running baseline scan)."
-                }
+                sh '''
+                    CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep "\\.java" || true)
+                    if [ -n "$CHANGED" ]; then
+                        echo "Changed Java files:"
+                        echo "$CHANGED"
+                    else
+                        echo "No Java changes detected — running baseline scan."
+                    fi
+                '''
             }
         }
 
@@ -37,7 +31,8 @@ pipeline {
                     cd cryptchat-server
                     mvn clean install -DskipTests -q
                     mvn dependency:copy-dependencies -q
-                    echo "Classes: $(find target/classes -name '*.class' 2>/dev/null | wc -l | tr -d ' ')"
+                    COUNT=$(find target/classes -name "*.class" 2>/dev/null | wc -l | tr -d " ")
+                    echo "Compiled classes: $COUNT"
                 '''
             }
         }
@@ -49,85 +44,96 @@ pipeline {
                     sleep 1
                     nohup socat TCP-LISTEN:8000,fork,reuseaddr TCP:qse-host:8000 >/dev/null 2>&1 &
                     sleep 2
-                    STATUS=$(curl -sf -o /dev/null -w '%{http_code}' http://localhost:8000/api-docs 2>/dev/null || echo 000)
-                    echo "QSE tunnel: $STATUS"
-                    [ "$STATUS" = "200" ] || { echo "ERROR: QSE not reachable — start IBM Quantum Safe Explorer on your Mac first."; exit 1; }
+                    STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/api-docs 2>/dev/null)
+                    echo "QSE tunnel status: $STATUS"
+                    if [ "$STATUS" != "200" ]; then
+                        echo "ERROR: Cannot reach QSE. Start IBM Quantum Safe Explorer on your Mac first."
+                        exit 1
+                    fi
                 '''
             }
         }
 
         stage('QSE Scan') {
             steps {
-                script {
-                    def projPath = "${env.WORKSPACE}/${env.PROJECT_DIR}"
-                    def cp       = "${projPath}/target/classes;${projPath}/target/dependency"
+                sh '''
+                    PROJ="${WORKSPACE}/cryptchat-server"
+                    CLASSPATH="${PROJ}/target/classes;${PROJ}/target/dependency"
 
-                    echo "=== Triggering QSE scan: ${projPath} ==="
-
-                    // Write payload to a temp file to avoid quoting issues
-                    def payload = """{
+                    # Write payload
+                    cat > /tmp/qse-payload.json << PAYLOAD
+{
   "extensions": [".java"],
-  "rootFolderPath": "${projPath}",
-  "classFilePath": "${cp}",
+  "rootFolderPath": "${PROJ}",
+  "classFilePath": "${CLASSPATH}",
   "enableLogging": false,
-  "appName": "${env.APP_NAME}",
-  "appVersion": "${env.APP_VERSION}",
+  "appName": "cryptchat-server",
+  "appVersion": "0.0.1-SNAPSHOT",
   "pathExclusionFilter": ["src/test"]
-}"""
-                    writeFile file: '/tmp/qse-payload.json', text: payload
+}
+PAYLOAD
 
-                    def resp = sh(
-                        script: "curl -sf -X POST '${env.QSE_URL}/api/v2/scan/scanAnalyticsProject' -H 'Content-Type: application/json' -d @/tmp/qse-payload.json",
-                        returnStdout: true
-                    ).trim()
+                    echo "=== Sending scan request to QSE ==="
+                    cat /tmp/qse-payload.json
 
-                    echo "QSE response: ${resp}"
-                    def scanId = readJSON(text: resp).scanId
-                    echo "Scan ID: ${scanId}"
-                    env.QSE_SCAN_ID = scanId
+                    RESP=$(curl -s -X POST http://localhost:8000/api/v2/scan/scanAnalyticsProject \
+                        --header "Content-Type: application/json" \
+                        --data-binary @/tmp/qse-payload.json)
 
-                    // Poll until COMPLETED
-                    def status = "", n = 0
-                    while (!(status in ["COMPLETED","FAILED"]) && n < 72) {
-                        sleep(time: 5, unit: 'SECONDS')
-                        def s = sh(script: "curl -sf '${env.QSE_URL}/api/v1/scan/${scanId}/status' || echo '{}'", returnStdout: true).trim()
-                        try { status = readJSON(text: s).status ?: "" } catch(e) { status = "" }
-                        n++
-                        echo "  [${n}] status: ${status}"
-                    }
-                    if (status == "FAILED") error("QSE scan FAILED — scanId: ${scanId}")
-                    if (n >= 72)           error("QSE scan timed out after 6 min")
-                }
+                    echo "QSE response: $RESP"
+                    SCAN_ID=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['scanId'])")
+                    echo "Scan ID: $SCAN_ID"
+                    echo "$SCAN_ID" > /tmp/qse-scan-id.txt
+
+                    # Poll for completion
+                    STATUS=""
+                    N=0
+                    while [ "$STATUS" != "COMPLETED" ] && [ "$STATUS" != "FAILED" ] && [ $N -lt 72 ]; do
+                        sleep 5
+                        SRESP=$(curl -s http://localhost:8000/api/v1/scan/${SCAN_ID}/status || echo "{}")
+                        STATUS=$(echo "$SRESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || echo "")
+                        N=$((N+1))
+                        echo "  [$N] status: $STATUS"
+                    done
+
+                    if [ "$STATUS" = "FAILED" ]; then
+                        echo "QSE scan FAILED"
+                        exit 1
+                    fi
+                    if [ $N -ge 72 ]; then
+                        echo "QSE scan timed out"
+                        exit 1
+                    fi
+                    echo "Scan COMPLETED."
+                '''
             }
         }
 
         stage('Findings & CBOM') {
             steps {
-                script {
-                    def id  = env.QSE_SCAN_ID
-                    def url = env.QSE_URL
+                sh '''
+                    SCAN_ID=$(cat /tmp/qse-scan-id.txt)
+                    echo "Fetching results for scan: $SCAN_ID"
 
-                    def findings = sh(script: "curl -sf '${url}/api/v2/scan/${id}/list_findings' || echo '{}'", returnStdout: true).trim()
-                    def summary  = sh(script: "curl -sf '${url}/api/v1/scan/${id}/report' || echo '{}'",        returnStdout: true).trim()
-                    def cbom     = sh(script: "curl -sf '${url}/api/v2/scan/${id}/cbom' || echo '{}'",          returnStdout: true).trim()
-
-                    writeFile file: 'qse-findings.json', text: findings
-                    writeFile file: 'qse-summary.json',  text: summary
-                    writeFile file: 'qse-cbom.json',     text: cbom
+                    curl -s http://localhost:8000/api/v2/scan/${SCAN_ID}/list_findings > qse-findings.json
+                    curl -s http://localhost:8000/api/v1/scan/${SCAN_ID}/report         > qse-summary.json
+                    curl -s http://localhost:8000/api/v2/scan/${SCAN_ID}/cbom           > qse-cbom.json
 
                     echo "========================================"
-                    echo " QSE SCAN RESULTS  (scanId: ${id})"
+                    echo " QSE SCAN RESULTS  (scanId: $SCAN_ID)"
                     echo "========================================"
-                    try {
-                        def s = readJSON text: summary
-                        echo " Total findings : ${s.totalFindings ?: 'see qse-findings.json'}"
-                        echo " Quantum unsafe : ${s.quantumUnsafe  ?: 'see qse-findings.json'}"
-                        echo " Weak crypto    : ${s.weakCrypto     ?: 'see qse-findings.json'}"
-                    } catch(e) {
-                        echo summary.take(500)
-                    }
-                    echo "Artifacts archived: qse-findings.json | qse-summary.json | qse-cbom.json"
-                }
+                    python3 -c "
+import json,sys
+try:
+    s = json.load(open('qse-summary.json'))
+    print(' Total findings :', s.get('totalFindings','N/A'))
+    print(' Quantum unsafe :', s.get('quantumUnsafe','N/A'))
+    print(' Weak crypto    :', s.get('weakCrypto','N/A'))
+except:
+    print(open('qse-summary.json').read()[:300])
+"
+                    echo "Artifacts: qse-findings.json | qse-summary.json | qse-cbom.json"
+                '''
             }
             post {
                 always { archiveArtifacts artifacts: 'qse-*.json', allowEmptyArchive: true }
@@ -136,7 +142,7 @@ pipeline {
     }
 
     post {
-        success { echo "BUILD #${env.BUILD_NUMBER} SUCCESS — QSE scan complete. Review qse-findings.json for crypto posture." }
-        failure { echo "BUILD #${env.BUILD_NUMBER} FAILED — check console output above." }
+        success { echo "BUILD #${BUILD_NUMBER} SUCCESS — QSE scan complete." }
+        failure { echo "BUILD #${BUILD_NUMBER} FAILED — check console." }
     }
 }
